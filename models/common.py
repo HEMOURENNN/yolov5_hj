@@ -59,6 +59,16 @@ from utils.torch_utils import copy_attr, smart_inference_mode
 
 def autopad(k, p=None, d=1):
     """
+        用于Conv函数和Classify函数中
+        根据卷积核大小k自动计算卷积核padding数（0填充）
+        v5中只有两种卷积：
+           1、下采样卷积:conv3x3 s=2 p=k//2=1
+           2、feature size不变的卷积:conv1x1 s=1 p=k//2=1
+           3、空洞卷积 dilation
+        :params k: 卷积核的kernel_size
+        :return p: 自动计算的需要pad值（0填充）
+    """
+    """
     Pads kernel to 'same' output shape, adjusting for optional dilation; returns padding size.
 
     `k`: kernel, `p`: padding, `d`: dilation.
@@ -75,6 +85,18 @@ class Conv(nn.Module):
     default_act = nn.SiLU()  # default activation
 
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+        """
+            在Focus、Bottleneck、BottleneckCSP、C3、SPP、DWConv、TransformerBloc等模块中调用
+            Standard convolution  conv+BN+act
+                :params c1: 输入的channel值
+                :params c2: 输出的channel值
+                :params k: 卷积的kernel_size
+                :params s: 卷积的stride
+                :params p: 卷积的padding  一般是None  可以通过autopad自行计算需要pad的padding数
+                :params g: 卷积的groups数  =1就是普通的卷积  >1就是深度可分离卷积
+                :params act: 激活函数类型   True就是SiLU()/Swish   False就是不使用激活函数
+                             类型是nn.Module就使用传进来的激活函数类型
+        """
         """Initializes a standard convolution layer with optional batch normalization and activation."""
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
@@ -86,6 +108,10 @@ class Conv(nn.Module):
         return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
+        """
+            用于Model类的fuse函数
+                融合conv+bn 加速推理 一般用于测试/验证阶段
+        """
         """Applies a fused convolution and activation function to the input tensor `x`."""
         return self.act(self.conv(x))
 
@@ -111,6 +137,17 @@ class DWConvTranspose2d(nn.ConvTranspose2d):
 class TransformerLayer(nn.Module):
     # Transformer layer https://arxiv.org/abs/2010.11929 (LayerNorm layers removed for better performance)
     def __init__(self, c, num_heads):
+        # 删除LayerNorm层以获得更好的性能
+        """
+        参数解释
+            c:表示输入特征的通道数
+            num_heads:表示多头注意力机制的头数
+            self.q:query查询,这是一个全连接层
+            self.k:keys注意力机制当中键的矩阵,这是一个全连接层
+            self.v:values注意力机制当中作为值的矩阵,这是一个全连接层
+            self.ma:使用Pytorch预定义的Multi-head Attention
+        这部分相当于原论文中的单个Encoder部分(只移除了两个Norm部分, 其他结构和原文中的Encoding一模一样)
+        """
         """
         Initializes a transformer layer, sans LayerNorm for performance, with multihead attention and linear layers.
 
@@ -129,6 +166,141 @@ class TransformerLayer(nn.Module):
         x = self.ma(self.q(x), self.k(x), self.v(x))[0] + x
         x = self.fc2(self.fc1(x)) + x
         return x
+
+
+class SELayer(nn.Module):
+    # SE注意力机制模块
+    # 这个模块是自己写的实验性模块，SELayer来自论文： Squeeze-and-Excitation Networks,
+    # 相关的理论请看：【https://blog.csdn.net/qq_38253797/article/details/117329519】SENet（2019）。
+    # https://arxiv.org/abs/1709.01507
+    def __init__(self, c1, r=16):
+        super(SELayer, self).__init__()
+        self.avgpool = nn.AdaptiveAvgPool2d(1)
+        self.l1 = nn.Linear(c1, c1 // r, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+        self.l2 = nn.Linear(c1 // r, c1, bias=False)
+        self.sig = nn.Sigmoid()
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avgpool(x).view(b, c)
+        y = self.l1(y)
+        y = self.relu(y)
+        y = self.l2(y)
+        y = self.sig(y)
+        y = y.view(b, c, 1, 1)
+        return x * y.expand_as(x)
+
+
+# CBAM
+class CBAM(nn.Module):
+    # 这个模块是自己写的实验性模块，CBAM来自论文： https://arxiv.org/abs/1807.06521。
+    # 相关的理论请看：【https://blog.csdn.net/qq_38253797/article/details/117292848】CBAM（2018）。
+    def __init__(self, c1, c2):
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttention(c1)
+        self.spatial_attention = SpatialAttention()
+
+    def forward(self, x):
+        out = self.channel_attention(x) * x
+        out = self.spatial_attention(out) * out
+        return out
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, in_planes, ratio=16):
+        """
+        :params: in_planes 输入模块的feature map的channel
+        :params: ratio 降维/升维因子
+        通道注意力则是将一个通道内的信息直接进行全局处理，容易忽略通道内的信息交互
+        """
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)  # 平均池化，是取整个channel所有元素的均值 [3,5,5] => [3,1,1]
+        self.max_pool = nn.AdaptiveMaxPool2d(1)  # 最大池化，是取整个channel所有元素的最大值[3,5,5] => [3,1,1]
+
+        # shared MLP
+        self.fc1 = nn.Conv2d(in_planes, in_planes // ratio, 1, bias=False)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Conv2d(in_planes // ratio, in_planes, 1, bias=False)
+
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc2(self.relu1(self.fc1(self.avg_pool(x))))
+        max_out = self.fc2(self.relu1(self.fc1(self.max_pool(x))))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+
+class SpatialAttention(nn.Module):
+    def __init__(self, kernel_size=7):
+        """对空间注意力来说，由于将每个通道中的特征都做同等处理，容易忽略通道间的信息交互"""
+        super(SpatialAttention, self).__init__()
+
+        # 这里要保持卷积后的feature尺度不变，必须要padding=kernel_size//2
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size // 2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):  # 输入x = [b, c, 56, 56]
+        avg_out = torch.mean(x, dim=1, keepdim=True)  # avg_out = [b, 1, 56, 56]  求x的每个像素在所有channel相同位置上的平均值
+        max_out, _ = torch.max(x, dim=1, keepdim=True)  # max_out = [b, 1, 56, 56]  求x的每个像素在所有channel相同位置上的最大值
+        x = torch.cat([avg_out, max_out], dim=1)  # x = [b, 2, 56, 56]  concat操作
+        x = self.conv1(x)  # x = [b, 1, 56, 56]  卷积操作，融合avg和max的信息，全方面考虑
+        return self.sigmoid(x)
+
+
+class CoorAttention(nn.Module):
+    """
+        CA Coordinate Attention 协同注意力机制
+        论文 CVPR2021: https://arxiv.org/abs/2103.02907
+        源码: https://github.com/Andrew-Qibin/CoordAttention/blob/main/coordatt.py
+        CA注意力机制是一个Spatial Attention 相比于SAM的7x7卷积, CA建立了远程依赖
+        可以考虑把SE + CA合起来用试试？
+    """
+
+    def __init__(self, inp, oup, reduction=32):
+        super(CoorAttention, self).__init__()
+        # [B, C, H, W] -> [B, C, H, 1]
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        # [B, C, H, W] -> [B, C, 1, W]
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+
+        mip = max(8, inp // reduction)  # 对中间层channel做一个限制 不得少于8
+
+        # 将x轴信息和y轴信息融合在一起
+        self.conv1 = nn.Conv2d(inp, mip, kernel_size=1, stride=1, padding=0)
+        self.bn1 = nn.BatchNorm2d(mip)
+        self.act = nn.Hardswish()  # 这里自己可以实验什么激活函数最佳 论文里是hard-swish
+
+        self.conv_h = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+        self.conv_w = nn.Conv2d(mip, oup, kernel_size=1, stride=1, padding=0)
+
+    def forward(self, x):
+        identity = x
+
+        n, c, h, w = x.size()
+        # [B, C, H, W] -> [B, C, H, 1]
+        x_h = self.pool_h(x)  # h avg pool
+        # [B, C, H, W] -> [B, C, 1, W] -> [B, C, W, 1]
+        x_w = self.pool_w(x).permute(0, 1, 3, 2)  # w avg pool
+
+        y = torch.cat([x_h, x_w], dim=2)  # [B, C, H+W, 1]
+        y = self.conv1(y)
+        y = self.bn1(y)
+        y = self.act(y)
+
+        # split  x_h: [B, C, H, 1]  x_w: [B, C, W, 1]
+        x_h, x_w = torch.split(y, [h, w], dim=2)
+        # [B, C, W, 1] -> [B, C, 1, W]
+        x_w = x_w.permute(0, 1, 3, 2)
+
+        a_h = self.conv_h(x_h).sigmoid()
+        a_w = self.conv_w(x_w).sigmoid()
+
+        # 基于W和H方向做注意力机制 建立远程依赖关系
+        out = identity * a_w * a_h
+
+        return out
 
 
 class TransformerBlock(nn.Module):
@@ -159,6 +331,15 @@ class TransformerBlock(nn.Module):
 class Bottleneck(nn.Module):
     # Standard bottleneck
     def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):
+        """
+        在BottleneckCSP和yolo.py的parse_model中调用
+            Standard bottleneck  Conv+Conv+shortcut
+            :params c1: 第一个卷积的输入channel
+            :params c2: 第二个卷积的输出channel
+            :params shortcut: bool 是否有shortcut连接 默认是True
+            :params g: 卷积分组的个数  =1就是普通卷积  >1就是深度可分离卷积
+            :params e: expansion ratio  e*c2就是第一个卷积的输出channel=第二个卷积的输入channel
+        """
         """Initializes a standard bottleneck layer with optional shortcut and group convolution, supporting channel
         expansion.
         """
@@ -178,6 +359,15 @@ class Bottleneck(nn.Module):
 class BottleneckCSP(nn.Module):
     # CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        """在C3模块和yolo.py的parse_model模块调用
+                CSP Bottleneck https://github.com/WongKinYiu/CrossStagePartialNetworks
+                :params c1: 整个BottleneckCSP的输入channel
+                :params c2: 整个BottleneckCSP的输出channel
+                :params n: 有n个Bottleneck
+                :params shortcut: bool Bottleneck中是否有shortcut，默认True
+                :params g: Bottleneck中的3x3卷积类型  =1普通卷积  >1深度可分离卷积
+                :params e: expansion ratio c2xe=中间其他所有层的卷积核个数/中间所有层的输入输出channel数
+        """
         """Initializes CSP bottleneck with optional shortcuts; args: ch_in, ch_out, number of repeats, shortcut bool,
         groups, expansion.
         """
@@ -223,6 +413,16 @@ class CrossConv(nn.Module):
 class C3(nn.Module):
     # CSP Bottleneck with 3 convolutions
     def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):
+        """
+            在C3TR模块和yolo.py的parse_model模块调用
+                CSP Bottleneck with 3 convolutions
+                :params c1: 整个C3的输入channel
+                :params c2: 整个C3的输出channel
+                :params n: 有n个Bottleneck
+                :params shortcut: bool Bottleneck中是否有shortcut，默认True
+                :params g: Bottleneck中的3x3卷积类型  =1普通卷积  >1深度可分离卷积
+                :params e: expansion ratio c2xe=中间其他所有层的卷积核个数/中间所有层的输入输出channel数
+        """
         """Initializes C3 module with options for channel count, bottleneck repetition, shortcut usage, group
         convolutions, and expansion.
         """
@@ -283,6 +483,12 @@ class C3Ghost(C3):
 class SPP(nn.Module):
     # Spatial Pyramid Pooling (SPP) layer https://arxiv.org/abs/1406.4729
     def __init__(self, c1, c2, k=(5, 9, 13)):
+        """在yolo.py的parse_model模块调用
+                空间金字塔池化 Spatial pyramid pooling layer used in YOLOv3-SPP
+                :params c1: SPP模块的输入channel
+                :params c2: SPP模块的输出channel
+                :params k: 保存着三个maxpool的卷积核大小 默认是(5, 9, 13)
+        """
         """Initializes SPP layer with Spatial Pyramid Pooling, ref: https://arxiv.org/abs/1406.4729, args: c1 (input channels), c2 (output channels), k (kernel sizes)."""
         super().__init__()
         c_ = c1 // 2  # hidden channels
@@ -328,6 +534,22 @@ class SPPF(nn.Module):
 class Focus(nn.Module):
     # Focus wh information into c-space
     def __init__(self, c1, c2, k=1, s=1, p=None, g=1, act=True):
+        """在yolo.py的parse_model函数中被调用
+            理论：从高分辨率图像中，周期性的抽出像素点重构到低分辨率图像中，即将图像相邻的四个位置进行堆叠，
+                聚焦wh维度信息到c通道空，提高每个点感受野，并减少原始信息的丢失，该模块的设计主要是减少计算量加快速度。
+            Focus wh information into c-space 把宽度w和高度h的信息整合到c空间中
+            先做4个slice 再concat 最后再做Conv
+            slice后 (b,c1,w,h) -> 分成4个slice 每个slice(b,c1,w/2,h/2)
+            concat(dim=1)后 4个slice(b,c1,w/2,h/2)) -> (b,4c1,w/2,h/2)
+            conv后 (b,4c1,w/2,h/2) -> (b,c2,w/2,h/2)
+            :params c1: slice后的channel
+            :params c2: Focus最终输出的channel
+            :params k: 最后卷积的kernel
+            :params s: 最后卷积的stride
+            :params p: 最后卷积的padding
+            :params g: 最后卷积的分组情况  =1普通卷积  >1深度可分离卷积
+            :params act: bool激活函数类型  默认True:SiLU()/Swish  False:不用激活函数
+        """
         """Initializes Focus module to concentrate width-height info into channel space with configurable convolution
         parameters.
         """
@@ -381,6 +603,11 @@ class GhostBottleneck(nn.Module):
 class Contract(nn.Module):
     # Contract width-height into channels, i.e. x(1,64,80,80) to x(1,256,40,40)
     def __init__(self, gain=2):
+        """
+        用在yolo.py的parse_model模块 用的不多
+            改变输入特征的shape 将w和h维度(缩小)的数据收缩到channel维度上(放大)
+            Contract width-height into channels, i.e. x(1,64,80,80) to x(1,256,40,40)
+        """
         """Initializes a layer to contract spatial dimensions (width-height) into channels, e.g., input shape
         (1,64,80,80) to (1,256,40,40).
         """
@@ -402,6 +629,11 @@ class Expand(nn.Module):
     # Expand channels into width-height, i.e. x(1,64,80,80) to x(1,16,160,160)
     def __init__(self, gain=2):
         """
+        用在yolo.py的parse_model模块  用的不多
+            改变输入特征的shape 将channel维度(变小)的数据扩展到W和H维度(变大)
+            Expand channels into width-height, i.e. x(1,64,80,80) to x(1,16,160,160)
+        """
+        """
         Initializes the Expand module to increase spatial dimensions by redistributing channels, with an optional gain
         factor.
 
@@ -416,13 +648,19 @@ class Expand(nn.Module):
         """
         b, c, h, w = x.size()  # assert C / s ** 2 == 0, 'Indivisible gain'
         s = self.gain
-        x = x.view(b, s, s, c // s**2, h, w)  # x(1,2,2,16,80,80)
+        x = x.view(b, s, s, c // s ** 2, h, w)  # x(1,2,2,16,80,80)
         x = x.permute(0, 3, 4, 1, 5, 2).contiguous()  # x(1,16,80,2,80,2)
-        return x.view(b, c // s**2, h * s, w * s)  # x(1,16,160,160)
+        return x.view(b, c // s ** 2, h * s, w * s)  # x(1,16,160,160)
 
 
 class Concat(nn.Module):
     # Concatenate a list of tensors along dimension
+    """
+        在yolo.py的parse_model模块调用
+            Concatenate a list of tensors along dimension
+            :params dimension: 沿着哪个维度进行concat
+    """
+
     def __init__(self, dimension=1):
         """Initializes a Concat module to concatenate tensors along a specified dimension."""
         super().__init__()
@@ -761,7 +999,16 @@ class DetectMultiBackend(nn.Module):
         return None, None
 
 
+# 这个模块是一个模型扩展模块，给模型封装成包含前处理、推理、后处理的模块(预处理 + 推理 + nms)，用的不多
 class AutoShape(nn.Module):
+    """
+    在yolo.py中Model类的autoshape函数中使用
+        - 将model封装成包含前处理、推理、后处理的模块(预处理 + 推理 + nms)  也是一个扩展模型功能的模块
+        - autoshape模块在train中不会被调用，当模型训练结束后，会通过这个模块对图片进行重塑，来方便模型的预测
+        - 自动调整shape，我们输入的图像可能不一样，可能来自cv2/np/PIL/torch 对输入进行预处理 调整其shape，
+        - 调整shape在datasets.py文件中,这个实在预测阶段使用的,model.eval(),模型就已经无法训练进入预测模式了
+        - input-robust model wrapper for passing cv2/np/PIL/torch inputs. Includes preprocessing, inference and NMS
+    """
     # YOLOv5 input-robust model wrapper for passing cv2/np/PIL/torch inputs. Includes preprocessing, inference and NMS
     conf = 0.25  # NMS confidence threshold
     iou = 0.45  # NMS IoU threshold
@@ -1046,9 +1293,18 @@ class Proto(nn.Module):
 
 
 class Classify(nn.Module):
+    """
+        这是一个二级分类模块, 什么是二级分类模块? 比如做车牌的识别, 先识别出车牌, 如果想对车牌上的字进行识别, 就需要二级分类进一步检测.
+        - 如果对模型输出的分类再进行分类, 就可以用这个模块. 不过这里这个类写的比较简单, 若进行复杂的二级分类, 可以根据自己的实际任务可以改写, 这里代码不唯一.
+        - Classification head, i.e. x(b,c1,20,20) to x(b,c2)
+        - 用于第二级分类   可以根据自己的任务自己改写，比较简单
+        - 比如车牌识别 检测到车牌之后还需要检测车牌在哪里，如果检测到侧拍后还想对车牌上的字再做识别的话就要进行二级分类
+
+    """
+
     # YOLOv5 classification head, i.e. x(b,c1,20,20) to x(b,c2)
     def __init__(
-        self, c1, c2, k=1, s=1, p=None, g=1, dropout_p=0.0
+            self, c1, c2, k=1, s=1, p=None, g=1, dropout_p=0.0
     ):  # ch_in, ch_out, kernel, stride, padding, groups, dropout probability
         super().__init__()
         c_ = 1280  # efficientnet_b0 size

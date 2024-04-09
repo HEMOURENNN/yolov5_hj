@@ -353,6 +353,7 @@ def smart_optimizer(model, name="Adam", lr=0.001, momentum=0.9, decay=1e-5):
 
     Groups are 0) weights with decay, 1) weights no decay, 2) biases no decay.
     """
+    # 将模型参数分为三组(weights、biases、bn)来进行分组优化
     g = [], [], []  # optimizer parameter groups
     bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
     for v in model.modules():
@@ -364,6 +365,7 @@ def smart_optimizer(model, name="Adam", lr=0.001, momentum=0.9, decay=1e-5):
             else:
                 g[0].append(p)  # weight (with decay)
 
+    # 选择优化器 / 提供了四个优化器——g0
     if name == "Adam":
         optimizer = torch.optim.Adam(g[2], lr=lr, betas=(momentum, 0.999))  # adjust beta1 to momentum
     elif name == "AdamW":

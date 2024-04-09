@@ -13,6 +13,16 @@ from utils import TryExcept, threaded
 
 
 def fitness(x):
+    """
+    通过指标加权的形式返回适应度(最终mAP)  在train.py中使用
+        Model fitness as a weighted combination of metrics
+        判断模型好坏的指标不是mAP@0.5也不是mAP@0.5:0.95 而是[P, R, mAP@0.5, mAP@0.5:0.95]4者的加权
+        一般w=[0,0,0.1,0.9]  即最终的mAP=0.1mAP@0.5 + 0.9mAP@0.5:0.95
+        P: 精度precision
+        R: 召回率recall
+        mAP@0.5: 即将IoU设为0.5时，计算每一类的所有图片的AP，然后所有类别求平均，即mAP
+        mAP@0.5:0.95: 表示在不同IoU阈值（从0.5到0.95，步长0.05）（0.5、0.55、0.6、0.65、0.7、0.75、0.8、0.85、0.9、0.95）上的平均mAP。
+    """
     """Calculates fitness of a model using weighted sum of metrics P, R, mAP@0.5, mAP@0.5:0.95."""
     w = [0.0, 0.0, 0.1, 0.9]  # weights for [P, R, mAP@0.5, mAP@0.5:0.95]
     return (x[:, :4] * w).sum(1)
@@ -28,6 +38,25 @@ def smooth(y, f=0.05):
 
 def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir=".", names=(), eps=1e-16, prefix=""):
     """
+    用于val.py中计算每个类的mAP
+        计算每一个类的AP指标(average precision)还可以 绘制P-R曲线
+        mAP基本概念: https://www.bilibili.com/video/BV1ez4y1X7g2
+        Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
+        :params tp(correct): [pred_sum, 10]=[1905, 10] bool 整个数据集所有图片中所有预测框在每一个iou条件下(0.5~0.95)10个是否是TP
+        :params conf: [img_sum]=[1905] 整个数据集所有图片的所有预测框的conf
+        :params pred_cls: [img_sum]=[1905] 整个数据集所有图片的所有预测框的类别
+                这里的tp、conf、pred_cls是一一对应的
+        :params target_cls: [gt_sum]=[929] 整个数据集所有图片的所有gt框的class
+        :params plot: bool
+        :params save_dir: runs\train\exp30
+        :params names: dict{key(class_index):value(class_name)} 获取数据集所有类别的index和对应类名
+        :return p[:, i]: [nc] 最大平均f1时每个类别的precision
+        :return r[:, i]: [nc] 最大平均f1时每个类别的recall
+        :return ap: [71, 10] 数据集每个类别在10个iou阈值下的mAP
+        :return f1[:, i]: [nc] 最大平均f1时每个类别的f1
+        :return unique_classes.astype('int32'): [nc] 返回数据集中所有的类别index
+    """
+    """
     Compute the average precision, given the recall and precision curves.
 
     Source: https://github.com/rafaelpadilla/Object-Detection-Metrics.
@@ -42,25 +71,43 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir=".", names
         The average precision as computed in py-faster-rcnn.
     """
 
-    # Sort by objectness
+    # 计算mAP 需要将tp按照conf降序排列
+    # Sort by objectness  按conf从大到小排序 返回数据对应的索引
     i = np.argsort(-conf)
+    # 得到重新排序后对应的 tp, conf, pre_cls
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
 
-    # Find unique classes
+    # Find unique classes 对类别去重, 因为计算ap是对每类进行
     unique_classes, nt = np.unique(target_cls, return_counts=True)
-    nc = unique_classes.shape[0]  # number of classes, number of detections
+    nc = unique_classes.shape[0]  # 数据集类别数 number of classes, number of detections
 
     # Create Precision-Recall curve and compute AP for each class
+    # px: [0, 1] 中间间隔1000个点 x坐标(用于绘制P-Conf、R-Conf、F1-Conf)
+    # py: y坐标[] 用于绘制IOU=0.5时的PR曲线
     px, py = np.linspace(0, 1, 1000), []  # for plotting
+
+    # 初始化 对每一个类别在每一个IOU阈值下 计算AP P R   ap=[nc, 10]  p=[nc, 1000] r=[nc, 1000]
     ap, p, r = np.zeros((nc, tp.shape[1])), np.zeros((nc, 1000)), np.zeros((nc, 1000))
-    for ci, c in enumerate(unique_classes):
-        i = pred_cls == c
+    for ci, c in enumerate(unique_classes):  # ci: index 0   c: class 0  unique_classes: 所有gt中不重复的class
+        i = pred_cls == c  # i: 记录着所有预测框是否是c类别框   是c类对应位置为True, 否则为False
+
+        # n_l: gt框中的c类别框数量  = tp+fn   254
         n_l = nt[ci]  # number of labels
+
+        # n_p: 预测框中c类别的框数量   695
         n_p = i.sum()  # number of predictions
+
+        # 如果没有预测到 或者 ground truth没有标注 则略过类别c
         if n_p == 0 or n_l == 0:
             continue
 
-        # Accumulate FPs and TPs
+        # Accumulate FPs(False Positive) and TPs(Ture Positive)   FP + TP = all_detections
+        # tp[i] 可以根据i中的的True/False觉定是否删除这个数  所有tp中属于类c的预测框
+        #       如: tp=[0,1,0,1] i=[True,False,False,True] b=tp[i]  => b=[0,1]
+        # a.cumsum(0)  会按照对象进行累加操作
+        # 一维按行累加如: a=[0,1,0,1]  b = a.cumsum(0) => b=[0,1,1,2]   而二维则按列累加
+        # fpc: 类别为c 顺序按置信度排列 截至到每一个预测框的各个iou阈值下FP个数 最后一行表示c类在该iou阈值下所有FP数
+        # tpc: 类别为c 顺序按置信度排列 截至到每一个预测框的各个iou阈值下TP个数 最后一行表示c类在该iou阈值下所有TP数
         fpc = (1 - tp[i]).cumsum(0)
         tpc = tp[i].cumsum(0)
 
@@ -248,7 +295,7 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
 
     # Intersection area
     inter = (b1_x2.minimum(b2_x2) - b1_x1.maximum(b2_x1)).clamp(0) * (
-        b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)
+            b1_y2.minimum(b2_y2) - b1_y1.maximum(b2_y1)
     ).clamp(0)
 
     # Union Area
@@ -260,10 +307,10 @@ def bbox_iou(box1, box2, xywh=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7
         cw = b1_x2.maximum(b2_x2) - b1_x1.minimum(b2_x1)  # convex (smallest enclosing box) width
         ch = b1_y2.maximum(b2_y2) - b1_y1.minimum(b2_y1)  # convex height
         if CIoU or DIoU:  # Distance or Complete IoU https://arxiv.org/abs/1911.08287v1
-            c2 = cw**2 + ch**2 + eps  # convex diagonal squared
+            c2 = cw ** 2 + ch ** 2 + eps  # convex diagonal squared
             rho2 = ((b2_x1 + b2_x2 - b1_x1 - b1_x2) ** 2 + (b2_y1 + b2_y2 - b1_y1 - b1_y2) ** 2) / 4  # center dist ** 2
             if CIoU:  # https://github.com/Zzh-tju/DIoU-SSD-pytorch/blob/master/utils/box/box_utils.py#L47
-                v = (4 / math.pi**2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
+                v = (4 / math.pi ** 2) * (torch.atan(w2 / h2) - torch.atan(w1 / h1)).pow(2)
                 with torch.no_grad():
                     alpha = v / (v - iou + (1 + eps))
                 return iou - (rho2 / c2 + v * alpha)  # CIoU
@@ -311,7 +358,7 @@ def bbox_ioa(box1, box2, eps=1e-7):
 
     # Intersection area
     inter_area = (np.minimum(b1_x2, b2_x2) - np.maximum(b1_x1, b2_x1)).clip(0) * (
-        np.minimum(b1_y2, b2_y2) - np.maximum(b1_y1, b2_y1)
+            np.minimum(b1_y2, b2_y2) - np.maximum(b1_y1, b2_y1)
     ).clip(0)
 
     # box2 area
